@@ -7,11 +7,37 @@
 #include <pty.h>
 #include "tmt.h"
 #include <sys/ioctl.h>
+#include <string.h>
+#include <errno.h>
+#include <time.h>
 
+#define TAILER_BUFSIZE 4096
 struct tailer
 {
     FILE *output;
+    char inbuf[TAILER_BUFSIZE];
+    char outbuf[TAILER_BUFSIZE];
+    unsigned int pending_inbuf;
+    TMT *vt;
 };
+
+void tail(struct tailer *i)
+{
+    TMT *vt = i->vt;
+    const TMTSCREEN *s = tmt_screen(vt);
+    const TMTPOINT *c = tmt_cursor(vt);
+    size_t last_row = c->r;
+
+    for(size_t row = 0; row <= last_row; row++) {
+        fprintf(i->output, "Tailing line %ld: ", row);
+        for(size_t col = 0; col <= s->ncol; col++) {
+            fprintf(i->output, "%lc", s->lines[row]->chars[col].c);
+        }
+        fprintf(i->output, "\n");
+    }
+    fflush(i->output);
+    tmt_write(vt, "\033[H\033[J", 0);
+}
 
 static void callback(tmt_msg_t m, TMT *vt, const void *a, void *p)
 {
@@ -34,6 +60,7 @@ int main(int argc, char **argv)
     int sk[2];
     int sk2[2];
     struct tailer instance;
+    memset(&instance, 0, sizeof(instance));
 
     while((o = getopt(argc, argv, "hf:")) != -1) {
         switch(o) {
@@ -55,15 +82,21 @@ int main(int argc, char **argv)
         exit(EXIT_FAILURE);
     }
 
+    struct termios old_tio, new_tio;
+    tcgetattr(STDIN_FILENO, &old_tio);
+    new_tio = old_tio;
+    new_tio.c_lflag &= ~(ICANON|ECHO);
+    tcsetattr(0, TCSANOW, &new_tio);
 
-    switch((pid = fork())) {
+    struct winsize w;
+    ioctl(0, TIOCGWINSZ, &w);
+
+    switch((pid = forkpty(&termfd, NULL, &old_tio, &w))) {
         case -1:/* Error */
             fprintf(stderr, "Unable to fork()\n");
             break;
 
         case 0: /* Child */
-            dup2(sk[0], 0);
-            dup2(sk2[0], 1);
             /* Execute child, passing the options */
             execvp(child_options[0], child_options);
 
@@ -77,48 +110,69 @@ int main(int argc, char **argv)
             break;
     }
 
-    struct winsize w;
-    ioctl(0, TIOCGWINSZ, &w);
 
     printf ("lines %d\n", w.ws_row);
     printf ("columns %d\n", w.ws_col);
 
-    TMT *vt = tmt_open(w.ws_row, w.ws_col, callback, &instance, NULL);
+    instance.vt = tmt_open(w.ws_row, w.ws_col, callback, &instance, NULL);
 
     instance.output = fopen("log.log", "w");
 
-    struct termios old_tio, new_tio;
-    tcgetattr(STDIN_FILENO, &old_tio);
-    new_tio = old_tio;
-    new_tio.c_lflag &= ~(ICANON|ECHO);
-    tcsetattr(0, TCSANOW, &new_tio);
 
     fcntl(0, F_SETFL, O_NONBLOCK);
-    fcntl(sk2[1], F_SETFL, O_NONBLOCK);
+    fcntl(termfd, F_SETFL, O_NONBLOCK);
 
 
     while(1) {
         fd_set fds;
         struct timeval tv = {.tv_sec = 0, .tv_usec = 500000};
+        int nbytes;
 
         FD_ZERO(&fds);
-        FD_SET(sk2[1], &fds);
+        FD_SET(termfd, &fds);
         FD_SET(0, &fds);
-        select(sk2[1]+1, &fds, NULL, NULL, &tv);
-        if(FD_ISSET(sk2[1], &fds)) {
-            int n;
-            char buf[1024];
-            while((n = read(sk2[1], buf, sizeof(buf))) > 0) {
-                write(1, buf, n);
-                tmt_write(vt, buf, n);
+        select(termfd+1, &fds, NULL, NULL, &tv);
+        while((nbytes = read(termfd, instance.outbuf, sizeof(instance.outbuf))) > 0) {
+            write(1, instance.outbuf, nbytes);
+            /* chunkuj do newlines */
+            int i, last = 0;
+            for(i = 0; i<nbytes; i++) {
+                if(instance.outbuf[i] == '\n') {
+                    /* a\nbc\n
+                     * i = 1   last = 0   (2 chars @ 0)  last = 2
+                     * i = 4   last = 2   (3 chars @ 2)  last = 5
+                     * */
+                    tmt_write(instance.vt, instance.outbuf + last, i - last + 1);
+                    tail(&instance);
+                    last = i + 1;
+                }
+            }
+            /* ostatni fragment */
+            if(i > last) {
+                tmt_write(instance.vt, instance.outbuf + last, i - last);
             }
         }
-        if(FD_ISSET(0, &fds)) {
-            int n;
-            char buf[1024];
-            while((n = read(0, buf, sizeof(buf))) > 0) {
-                write(sk[1], buf, n);
-                write(1, buf, n);
+        if(nbytes == 0) {
+            /* EOF */
+            break;
+        }
+        if(nbytes < 0) {
+            if(errno != EAGAIN) {
+                perror("read");
+            }
+        }
+
+        char buf[1024];
+        while((nbytes = read(0, buf, sizeof(buf))) > 0) {
+            write(termfd, buf, nbytes);
+        }
+        if(nbytes == 0) {
+            /* EOF */
+            break;
+        }
+        if(nbytes < 0) {
+            if(errno != EAGAIN) {
+                perror("read");
             }
         }
     }
