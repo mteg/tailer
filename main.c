@@ -32,6 +32,7 @@ int main(int argc, char **argv)
     int pid, o, termfd;
     char s[100];
     int sk[2];
+    int sk2[2];
     struct tailer instance;
 
     while((o = getopt(argc, argv, "hf:")) != -1) {
@@ -48,6 +49,11 @@ int main(int argc, char **argv)
         perror("socketpair");
         exit(EXIT_FAILURE);
     }
+    if(socketpair(AF_UNIX, SOCK_STREAM, 0, sk2) < 0)
+    {
+        perror("socketpair");
+        exit(EXIT_FAILURE);
+    }
 
 
     switch((pid = fork())) {
@@ -56,9 +62,9 @@ int main(int argc, char **argv)
             break;
 
         case 0: /* Child */
+            dup2(sk[0], 0);
+            dup2(sk2[0], 1);
             /* Execute child, passing the options */
-            dup2(sk[1], 1) ;
-            close(sk[0]);
             execvp(child_options[0], child_options);
 
             perror("execvp");
@@ -80,7 +86,15 @@ int main(int argc, char **argv)
     TMT *vt = tmt_open(w.ws_row, w.ws_col, callback, &instance, NULL);
 
     instance.output = fopen("log.log", "w");
-    fcntl(sk[0], F_SETFL, O_NONBLOCK);
+
+    struct termios old_tio, new_tio;
+    tcgetattr(STDIN_FILENO, &old_tio);
+    new_tio = old_tio;
+    new_tio.c_lflag &= ~(ICANON|ECHO);
+    tcsetattr(0, TCSANOW, &new_tio);
+
+    fcntl(0, F_SETFL, O_NONBLOCK);
+    fcntl(sk2[1], F_SETFL, O_NONBLOCK);
 
 
     while(1) {
@@ -88,14 +102,23 @@ int main(int argc, char **argv)
         struct timeval tv = {.tv_sec = 0, .tv_usec = 500000};
 
         FD_ZERO(&fds);
-        FD_SET(sk[0], &fds);
-        select(sk[0]+1, &fds, NULL, NULL, &tv);
-        if(FD_ISSET(sk[0], &fds)) {
+        FD_SET(sk2[1], &fds);
+        FD_SET(0, &fds);
+        select(sk2[1]+1, &fds, NULL, NULL, &tv);
+        if(FD_ISSET(sk2[1], &fds)) {
             int n;
             char buf[1024];
-            while((n = read(sk[0], buf, sizeof(buf))) > 0) {
+            while((n = read(sk2[1], buf, sizeof(buf))) > 0) {
                 write(1, buf, n);
                 tmt_write(vt, buf, n);
+            }
+        }
+        if(FD_ISSET(0, &fds)) {
+            int n;
+            char buf[1024];
+            while((n = read(0, buf, sizeof(buf))) > 0) {
+                write(sk[1], buf, n);
+                write(1, buf, n);
             }
         }
     }
