@@ -16,12 +16,14 @@
 #include "tmt.h"
 
 #define TAILER_BUFSIZE 4096
+
 struct tailer
 {
     FILE *output;
     char inbuf[TAILER_BUFSIZE];
     char outbuf[TAILER_BUFSIZE];
-    unsigned int pending_inbuf;
+    size_t out_offset;
+    mbstate_t out_state;
     TMT *vt;
     char *prefix;
     bool quit, timestamp, ignore_resize;
@@ -82,15 +84,19 @@ static void tail(struct tailer *i)
                 break;
             }
         }
-        if(s->lines[row]->chars[last].c != 0x20) {
+        bool empty_line = (s->lines[row]->chars[last].c == 0x20);
+        if((!empty_line) || row < last_row) {
             char out[MB_CUR_MAX * last + 1];
             size_t pos = 0;
-            mbstate_t mbs;
-            memset(&mbs, 0, sizeof(mbs));
-            for(size_t col = 0; col <= last; col++) {
-                size_t progress = wcrtomb(out + pos, s->lines[row]->chars[col].c, &mbs);
-                if(progress != (size_t) -1) {
-                    pos += progress;
+
+            if(!empty_line) {
+                mbstate_t mbs;
+                memset(&mbs, 0, sizeof(mbs));
+                for(size_t col = 0; col <= last; col++) {
+                    size_t progress = wcrtomb(out + pos, s->lines[row]->chars[col].c, &mbs);
+                    if(progress != (size_t) -1) {
+                        pos += progress;
+                    }
                 }
             }
             if(i->timestamp) {
@@ -108,7 +114,9 @@ static void tail(struct tailer *i)
             if(i->prefix) {
                 fprintf(i->output, "%s ", i->prefix);
             }
-            fwrite(out, pos, 1, i->output);
+            if(pos) {
+                fwrite(out, pos, 1, i->output);
+            }
             fputc('\n', i->output);
         }
     }
@@ -219,7 +227,7 @@ int main(int argc, char **argv)
     signal (SIGWINCH, sig_winch);
 
     instance.vt = tmt_open(wsize.ws_row, wsize.ws_col, callback, &instance, NULL);
-    fcntl(0, F_SETFL, O_NONBLOCK);
+    fcntl(STDIN_FILENO, F_SETFL, O_NONBLOCK);
     fcntl(termfd, F_SETFL, O_NONBLOCK);
 
     while(!instance.quit) {
@@ -230,31 +238,50 @@ int main(int argc, char **argv)
         FD_ZERO(&fds);
         FD_SET(termfd, &fds);
         if(termfd != 0) {
-            FD_SET(0, &fds);
+            FD_SET(STDIN_FILENO, &fds);
         }
         select(termfd+1, &fds, NULL, NULL, &tv);
         if(instance.quit) {
             break;
         }
-        while((nbytes = read(termfd, instance.outbuf, sizeof(instance.outbuf))) > 0) {
-            if(!write_loop(STDOUT_FILENO, instance.outbuf, nbytes)) {
+        while((nbytes = read(termfd, instance.outbuf + instance.out_offset, sizeof(instance.outbuf) - instance.out_offset)) > 0) {
+            if(!write_loop(STDOUT_FILENO, instance.outbuf + instance.out_offset, nbytes)) {
                 instance.quit = true;
                 break;
             }
-            /* chunkuj do newlines */
-            int i, last = 0;
-            for(i = 0; i<nbytes; i++) {
-                if(instance.outbuf[i] == '\n') {
-                    tmt_write(instance.vt, instance.outbuf + last, i - last + 1);
-                    tail(&instance);
-                    last = i + 1;
+            size_t i = 0, last = 0;
+            size_t ninbuffer = nbytes + instance.out_offset;
+
+            while(i<ninbuffer) {
+                wchar_t potential_nl;
+                size_t seq = mbrtowc(&potential_nl, instance.outbuf + i, ninbuffer - i, &instance.out_state);
+                if(seq == (size_t) -1) {
+                    /* Wrong multibyte sequence, skip this byte */
+                    i++;
+                    continue;
+                } else if(seq == (size_t) -2 || (i == (ninbuffer-2))) {
+                    /* Incomplete multibyte sequence, big trouble */
+                    break;
+                } else {
+                    /* All fine, advance i as necessary */
+                    i += seq;
+                    if(potential_nl == L'\n') {
+                        tmt_write(instance.vt, instance.outbuf + last, i - last);
+                        tail(&instance);
+                        last = i;
+                    }
                 }
             }
             fflush(instance.output);
-            /* ostatni fragment */
+
             if(i > last) {
                 tmt_write(instance.vt, instance.outbuf + last, i - last);
             }
+            if(ninbuffer > i) {
+                /* Trailing unprocessed characters! Big trouble! */
+                memmove(instance.outbuf, instance.outbuf + i, ninbuffer - i);
+            }
+            instance.out_offset = ninbuffer - i;
         }
         if(nbytes == 0) {
             /* EOF */
